@@ -181,13 +181,19 @@ class Chronos2Pipeline(BaseChronosPipeline):
             )
 
         # Create a copy of the model to avoid modifying the original
-        config = deepcopy(self.model.config)
+        # config = deepcopy(self.model.config)
 
-        config.chronos_config["context_length"] = context_length
+        # config.chronos_config["context_length"] = context_length
         
+        # config.chronos_config["time_encoding_scale"] = config.chronos_config.get("time_encoding_scale", context_length)
+
+        if context_length is None:
+            context_length = self.model_context_length
+
+        config = deepcopy(self.model.config)
+        config.chronos_config["context_length"] = context_length
         config.chronos_config["time_encoding_scale"] = config.chronos_config.get("time_encoding_scale", context_length)
-
-
+ 
         model = Chronos2Model(config).to(self.model.device)  # type: ignore
         model.load_state_dict(self.model.state_dict())
 
