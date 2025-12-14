@@ -53,6 +53,7 @@ class Chronos2EncoderBlock(nn.Module):
         attention_mask: torch.Tensor,
         group_time_mask: torch.Tensor,
         num_output_patches: int = 1,
+        reg_token_index: int | None=None,
         output_attentions: bool = False,
     ) -> Chronos2EncoderBlockOutput:
         # apply time attention
@@ -60,6 +61,8 @@ class Chronos2EncoderBlock(nn.Module):
             hidden_states,
             position_ids=position_ids,
             attention_mask=attention_mask,
+            num_output_patches=num_output_patches,
+            reg_token_index=reg_token_index,
             output_attentions=output_attentions,
         )
         hidden_states = time_self_attn_outputs[0]
