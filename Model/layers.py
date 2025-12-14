@@ -294,6 +294,7 @@ class MHA(nn.Module):
 class TimeSelfAttention(nn.Module):
     def __init__(self, config: Chronos2CoreConfig):
         super().__init__()
+        self.config = config
         self.self_attention = MHA(config, use_rope=True)
         self.layer_norm = Chronos2LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
         self.dropout = nn.Dropout(config.dropout_rate)
@@ -301,18 +302,240 @@ class TimeSelfAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        *,
         attention_mask: torch.Tensor,
         position_ids: torch.Tensor,
+        num_output_patches: int = 1,
+        reg_token_index: int | None=None,
         output_attentions: bool = False,
     ) -> AttentionOutput:
+        """
+        Args:
+            hidden_states: [B, S, D]
+            attention_mask:
+              - full mode: additive 4D mask [B, H, Q, K]
+              - sparse mode: 2D padding mask [B, S] (1=valid, 0=pad)
+            position_ids: [B, S] (for RoPE)
+            num_output_patches: number of future query tokens (last tokens in sequence)
+            reg_token_index: position of [REG] if present, else None
+        """
         normed_hidden_states = self.layer_norm(hidden_states)
-        attention_output: AttentionOutput = self.self_attention(
-            normed_hidden_states, position_ids=position_ids, mask=attention_mask, output_attentions=output_attentions
+
+        if self.config.time_attention_type == "full": 
+            # Original dense behavior (expects additive 4D mask)
+            attention_output: AttentionOutput = self.self_attention(
+                normed_hidden_states, 
+                position_ids=position_ids,
+                mask=attention_mask, 
+                output_attentions=output_attentions
+            )
+            out = attention_output.hidden_states
+            assert out is not None
+            hidden_states = hidden_states + self.dropout(out)
+    
+            return AttentionOutput(hidden_states=hidden_states, attn_weights=attention_output.attn_weights)
+        if self.config.time_attention_type != "windowed_future_global": 
+            raise ValueError(f"Unknown time_attention_type={self.config.time_attention_type!r}")
+
+        # Sparse path: do not allow returning attentions (would force dense tensors)
+        if output_attentions:
+            raise ValueError("output_attentions=True is not supported for sparse time attention.")
+
+        if attention_mask.ndim != 2:
+            raise ValueError(
+                f"Sparse time attention expects a 2D padding mask [B, S], got shape {tuple(attention_mask.shape)}"
+            )
+        # Compute sparse attention output (projected, then output-projected)
+        attn_out = self._windowed_future_global_attention(
+            hidden_states=normed_hidden_states,
+            padding_mask=attention_mask,
+            position_ids=position_ids,
+            num_output_patches=num_output_patches,
+            reg_token_index=reg_token_index,
         )
-        hidden_states = hidden_states + self.dropout(attention_output[0])
 
-        return AttentionOutput(hidden_states=hidden_states, attn_weights=attention_output.attn_weights)
+        hidden_states = hidden_states + self.dropout(attn_out)
+        return AttentionOutput(hidden_states=hidden_states, attn_weights=None)
 
+    def _project_qkv_with_rope(
+        self, hidden_states: torch.Tensor, position_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+            q, k, v of shape [B, H, S, Hd] with RoPE applied to (q, k).
+        """
+        B, S, _ = hidden_states.shape
+        H = self.self_attention.n_heads
+        Hd = self.self_attention.kv_proj_dim
+
+        # [B, S, H*Hd] -> [B, H, S, Hd]
+        q = rearrange(self.self_attention.q(hidden_states), "b s (h d) -> b h s d", h=H, d=Hd)
+        k = rearrange(self.self_attention.k(hidden_states), "b s (h d) -> b h s d", h=H, d=Hd)
+        v = rearrange(self.self_attention.v(hidden_states), "b s (h d) -> b h s d", h=H, d=Hd)
+
+        # RoPE (match MHA behavior: use v tensor to compute cos/sin, then apply to q/k)
+        cos, sin = self.self_attention.rope_embed(v, position_ids)
+        q, k = RoPE.apply_rotary_pos_emb(q, k, cos, sin)
+
+        return q, k, v
+
+    def _global_attention(
+        self,
+        q: torch.Tensor,          # [B, H, Q, Hd]
+        k: torch.Tensor,          # [B, H, K, Hd]
+        v: torch.Tensor,          # [B, H, K, Hd]
+        key_padding_mask: torch.Tensor,  # [B, K] bool
+    ) -> torch.Tensor:
+        """
+        Global attention with **no scaling** (to match original Chronos-2 eager behavior).
+        Returns: [B, H, Q, Hd]
+        """
+        dtype = q.dtype
+        finfo_min = torch.finfo(dtype).min
+
+        # Build additive mask [B, 1, 1, K] with 0 for valid, -inf for invalid
+        mask = torch.where(key_padding_mask, torch.zeros((), device=q.device, dtype=dtype), torch.tensor(finfo_min, device=q.device, dtype=dtype))
+        mask = mask.view(key_padding_mask.shape[0], 1, 1, key_padding_mask.shape[1])
+
+        attn_impl = self.config._attn_implementation
+        # In sparse mode we never return weights, so SDPA is safe if enabled.
+        if attn_impl == "sdpa":
+            return nn.functional.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=mask,
+                dropout_p=self.self_attention.dropout if self.training else 0.0,
+                scale=1.0,  # IMPORTANT: no scaling
+            )
+
+        # Eager fallback
+        scores = torch.matmul(q, k.transpose(-1, -2))  # [B, H, Q, K]
+        scores = scores + mask
+        w = nn.functional.softmax(scores.float(), dim=-1).to(dtype)
+        w = nn.functional.dropout(w, p=self.self_attention.dropout, training=self.training)
+        return torch.matmul(w, v)
+
+    def _windowed_future_global_attention(
+        self,
+        *,
+        hidden_states: torch.Tensor,      # [B, S, D]
+        padding_mask: torch.Tensor,       # [B, S] (float/bool)
+        position_ids: torch.Tensor,       # [B, S]
+        num_output_patches: int,
+        reg_token_index: int | None,
+    ) -> torch.Tensor:
+        """
+        Sparse attention:
+          - context queries: windowed keys, restricted to context (+REG if present), plus optional global REG key
+          - future queries (last num_output_patches): global keys (masked only by padding)
+          - optional REG global query: REG attends globally to context (+REG), never to future
+        Returns: [B, S, D]
+        """
+        B, S, D = hidden_states.shape
+        if num_output_patches < 1 or num_output_patches > S:
+            raise ValueError(f"num_output_patches must be in [1, {S}], got {num_output_patches}")
+
+        future_start = S - num_output_patches
+        context_end = future_start  # includes [REG] if it is placed before the future tokens
+
+        # Key padding mask: True = keep, False = masked
+        if padding_mask.dtype == torch.bool:
+            key_pad = padding_mask
+        else:
+            key_pad = padding_mask > 0.0
+
+        # Project q/k/v once for the full sequence
+        q, k, v = self._project_qkv_with_rope(hidden_states, position_ids)  # [B, H, S, Hd]
+        H = q.shape[1]
+        Hd = q.shape[-1]
+
+        out = torch.zeros((B, H, S, Hd), device=hidden_states.device, dtype=hidden_states.dtype)
+
+        # -------------------------
+        # 1) Context queries: windowed attention over keys in [0, context_end)
+        # -------------------------
+        radius = int(getattr(self.config, "time_local_radius", 128))
+        chunk_size = int(getattr(self.config, "time_attention_chunk_size", 32))
+        radius = max(0, radius)
+        chunk_size = max(1, chunk_size)
+        win = 2 * radius + 1
+
+        if context_end > 0:
+            k_ctx = k[:, :, :context_end, :]  # [B, H, Ctx, Hd]
+            v_ctx = v[:, :, :context_end, :]
+            key_pad_ctx = key_pad[:, :context_end]  # [B, Ctx]
+
+            offsets = torch.arange(-radius, radius + 1, device=hidden_states.device, dtype=torch.long)  # [win]
+
+            for start in range(0, context_end, chunk_size):
+                end = min(context_end, start + chunk_size)
+                q_pos = torch.arange(start, end, device=hidden_states.device, dtype=torch.long)  # [C]
+                C = q_pos.numel()
+
+                # Raw window indices [C, win]
+                idx_raw = q_pos[:, None] + offsets[None, :]  # [C, win]
+                valid = (idx_raw >= 0) & (idx_raw < context_end)
+                idx = idx_raw.masked_fill(~valid, 0)  # safe for gather
+
+                # Optional: append REG as a global key for all context queries
+                if bool(getattr(self.config, "time_reg_is_global", False)) and reg_token_index is not None:
+                    if not (0 <= reg_token_index < context_end):
+                        # If reg_token_index is out of context_end, ignore it (it must be before future)
+                        pass
+                    else:
+                        # Add a final column for reg_token_index, but mask it out if it already exists in-window
+                        in_window = (idx == reg_token_index) & valid
+                        need_reg = ~in_window.any(dim=-1)  # [C]
+                        idx = torch.cat(
+                            [idx, torch.full((C, 1), reg_token_index, device=idx.device, dtype=idx.dtype)], dim=-1
+                        )
+                        valid = torch.cat([valid, need_reg[:, None]], dim=-1)
+
+                W = idx.shape[1]
+
+                # Gather K/V: [B, H, C, W, Hd]
+                idx_bhw = idx[None, None, :, :].expand(B, H, C, W)
+                idx_bhw_hd = idx_bhw.unsqueeze(-1).expand(B, H, C, W, Hd)
+                k_win = torch.gather(k_ctx, dim=2, index=idx_bhw_hd)
+                v_win = torch.gather(v_ctx, dim=2, index=idx_bhw_hd)
+
+                # Key padding gathered: [B, C, W]
+                idx_bcw = idx[None, :, :].expand(B, C, W)
+                key_ok = torch.gather(key_pad_ctx, dim=1, index=idx_bcw)  # [B, C, W]
+                key_ok = key_ok & valid[None, :, :]  # also apply window validity
+
+                # Scores: [B, H, C, W] (no scaling)
+                q_chunk = q[:, :, start:end, :]  # [B, H, C, Hd]
+                scores = (q_chunk.unsqueeze(-2) * k_win).sum(dim=-1)
+
+                finfo_min = torch.finfo(scores.dtype).min
+                scores = scores.masked_fill(~key_ok[:, None, :, :], finfo_min)
+
+                w = nn.functional.softmax(scores.float(), dim=-1).to(scores.dtype)
+                w = nn.functional.dropout(w, p=self.self_attention.dropout, training=self.training)
+
+                out[:, :, start:end, :] = (w.unsqueeze(-1) * v_win).sum(dim=-2)
+
+            # Optional: REG as a global *query* (REG attends to all context keys)
+            if bool(getattr(self.config, "time_reg_is_global", False)) and reg_token_index is not None:
+                if 0 <= reg_token_index < context_end:
+                    q_reg = q[:, :, reg_token_index : reg_token_index + 1, :]  # [B, H, 1, Hd]
+                    out_reg = self._global_attention(q_reg, k_ctx, v_ctx, key_pad_ctx)  # [B, H, 1, Hd]
+                    out[:, :, reg_token_index : reg_token_index + 1, :] = out_reg
+
+        # -------------------------
+        # 2) Future queries: global attention over all keys [0, S)
+        # -------------------------
+        q_fut = q[:, :, future_start:, :]  # [B, H, num_output_patches, Hd]
+        out_fut = self._global_attention(q_fut, k, v, key_pad)  # [B, H, num_output_patches, Hd]
+        out[:, :, future_start:, :] = out_fut
+
+        # Output projection back to [B, S, D]
+        out_2d = rearrange(out, "b h s d -> b s (h d)")
+        out_2d = self.self_attention.o(out_2d)
+        return out_2d
+        
 
 class TimeCrossAttention(nn.Module):
     def __init__(self, config: Chronos2CoreConfig):
