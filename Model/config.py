@@ -66,10 +66,10 @@ class Chronos2CoreConfig(PretrainedConfig):
         pad_token_id: int = 0,
         rope_theta: float = 10000.0,
         attn_implementation: Literal["eager", "sdpa"] | None = None,
-        time_attention_type: Literal["full", "windowed_future_global"] - "full",
+        time_attention_type: Literal["full", "windowed_future_global"] = "full",
         time_local_radius: int = 128, 
         time_attention_chunk_size: int = 32, 
-        time_reg_is_global: bool: False,
+        time_reg_is_global: bool= False,
         **kwargs,
     ):
         self.vocab_size = vocab_size
