@@ -1,132 +1,116 @@
-Project state summary (Chronos-2 sparse time attention)
-Goal implemented
+Here’s a copy-paste “state + next steps” note you can drop into a new chat anytime.
 
-We added a memory-efficient sparse time self-attention mode for the Chronos-2 encoder with this sequence layout:
+---
 
-[context patch tokens] + ([REG] optional) + [future patch tokens]
+## Project state summary (Chronos-2 sparse time attention)
+
+### Goal implemented
+
+We added a **memory-efficient sparse time self-attention** mode for the Chronos-2 encoder with this sequence layout:
+
+`[context patch tokens] + ([REG] optional) + [future patch tokens]`
 
 Sparse attention behavior (“windowed_future_global”):
 
-Context queries attend only to a sliding window of keys (radius = time_local_radius)
+* **Context queries** attend only to a **sliding window** of keys (radius = `time_local_radius`)
+* Context keys are restricted to **context (+ REG if present)** → **no context→future leakage**
+* Optional: `[REG]` acts as a **global key and global query** when `time_reg_is_global=True`
+* **Future queries** (last `num_output_patches` tokens) attend **globally to all keys** (only padding masked)
+* In sparse mode we **do not create** a dense `[B, heads, S, S]` attention mask
+* In sparse mode we **refuse** `output_attentions=True` to avoid forcing dense tensors
 
-Context keys are restricted to context (+ REG if present) → no context→future leakage
+### Files changed
 
-Optional: [REG] acts as a global key and global query when time_reg_is_global=True
+#### 1) `config.py`
 
-Future queries (last num_output_patches tokens) attend globally to all keys (only padding masked)
+Added sparse time-attention knobs to `Chronos2CoreConfig.__init__` and stored them:
 
-In sparse mode we do not create a dense [B, heads, S, S] attention mask
+* `time_attention_type: Literal["full", "windowed_future_global"] = "full"`
+* `time_local_radius: int = 128`
+* `time_attention_chunk_size: int = 32`
+* `time_reg_is_global: bool = False`
 
-In sparse mode we refuse output_attentions=True to avoid forcing dense tensors
-
-Files changed
-1) config.py
-
-Added sparse time-attention knobs to Chronos2CoreConfig.__init__ and stored them:
-
-time_attention_type: Literal["full", "windowed_future_global"] = "full"
-
-time_local_radius: int = 128
-
-time_attention_chunk_size: int = 32
-
-time_reg_is_global: bool = False
-
-2) model.py
+#### 2) `model.py`
 
 Plumbed metadata needed by sparse time attention and avoided 4D masks in sparse mode:
 
-In Chronos2Model.encode():
+* In `Chronos2Model.encode()`:
 
-computed reg_token_index = num_context_patches when [REG] is inserted
+  * computed `reg_token_index = num_context_patches` when `[REG]` is inserted
+  * passed `num_output_patches` and `reg_token_index` into `self.encoder(...)`
+* In `Chronos2Encoder.__init__`:
 
-passed num_output_patches and reg_token_index into self.encoder(...)
+  * added `self.config = config`
+* In `Chronos2Encoder.forward()`:
 
-In Chronos2Encoder.__init__:
+  * added args: `num_output_patches`, `reg_token_index`
+  * built **4D additive mask only if** `time_attention_type == "full"`, otherwise passed the **2D padding mask**
+  * passed `num_output_patches` and `reg_token_index` into each encoder block
+* In `Chronos2EncoderBlock.forward()`:
 
-added self.config = config
+  * added args: `num_output_patches`, `reg_token_index`
+  * forwarded them into `TimeSelfAttention(...)`
 
-In Chronos2Encoder.forward():
+#### 3) `layers.py`
 
-added args: num_output_patches, reg_token_index
+Replaced `class TimeSelfAttention` with a full implementation:
 
-built 4D additive mask only if time_attention_type == "full", otherwise passed the 2D padding mask
+* Dense path unchanged when `time_attention_type == "full"`
+* Sparse path `"windowed_future_global"`:
 
-passed num_output_patches and reg_token_index into each encoder block
+  * projects Q/K/V once (with RoPE)
+  * computes context output via **window gather** (chunked by `time_attention_chunk_size`)
+  * computes future output via **global attention only for last `num_output_patches` queries**
+  * optional `[REG]` global key/query logic
+  * rejects `output_attentions=True` in sparse mode
 
-In Chronos2EncoderBlock.forward():
-
-added args: num_output_patches, reg_token_index
-
-forwarded them into TimeSelfAttention(...)
-
-3) layers.py
-
-Replaced class TimeSelfAttention with a full implementation:
-
-Dense path unchanged when time_attention_type == "full"
-
-Sparse path "windowed_future_global":
-
-projects Q/K/V once (with RoPE)
-
-computes context output via window gather (chunked by time_attention_chunk_size)
-
-computes future output via global attention only for last num_output_patches queries
-
-optional [REG] global key/query logic
-
-rejects output_attentions=True in sparse mode
-
-Known fixes that were required (must be present)
+### Known fixes that were required (must be present)
 
 To ensure the code imports and runs:
 
-config.py: fixed typos in the new sparse args (= not -, bool = False not bool: False)
+* `config.py`: fixed typos in the new sparse args (`=` not `-`, `bool = False` not `bool: False`)
+* `model.py`: removed stray `e`, fixed `time_attention_mast` → `time_attention_mask`, fixed indentation, fixed encoder call to correctly pass:
 
-model.py: removed stray e, fixed time_attention_mast → time_attention_mask, fixed indentation, fixed encoder call to correctly pass:
+  * `inputs_embeds=...`
+  * `attention_mask=...`
+  * `group_ids=...`
+  * `num_output_patches=num_output_patches`
+  * `reg_token_index=reg_token_index`
 
-inputs_embeds=...
+### Optional but recommended fix
 
-attention_mask=...
+`pipeline.py` fine-tune path: ensure `context_length` fallback is applied **before** writing into `config.chronos_config["context_length"]`, otherwise model may be created with `context_length=None`.
 
-group_ids=...
+---
 
-num_output_patches=num_output_patches
-
-reg_token_index=reg_token_index
-
-Optional but recommended fix
-
-pipeline.py fine-tune path: ensure context_length fallback is applied before writing into config.chronos_config["context_length"], otherwise model may be created with context_length=None.
-
-How to enable sparse attention
+## How to enable sparse attention
 
 In the config used to instantiate Chronos-2:
 
+```python
 config.chronos_config["time_attention_type"] = "windowed_future_global"
 config.chronos_config["time_local_radius"] = 128           # tune
 config.chronos_config["time_attention_chunk_size"] = 32    # tune
 config.chronos_config["time_reg_is_global"] = True or False
+```
 
-Next stage (what to do next)
+---
 
-Fine-tuning wiring + long-context setup, specifically:
+## Next stage (what to do next)
 
-Ensure training/inference uses the sparse path (verify time_attention_type is set in the actual config at runtime).
+**Fine-tuning wiring + long-context setup**, specifically:
 
-Make sure context_length is not silently truncating in dataset/pipeline/trainer.
+1. Ensure training/inference uses the sparse path (verify `time_attention_type` is set in the actual config at runtime).
+2. Make sure `context_length` is not silently truncating in dataset/pipeline/trainer.
+3. Confirm `num_output_patches` is correct for your training objective (future tokens must be the last tokens).
+4. Decide batch size + grad accumulation settings for long contexts (e.g., 8k/16k) and check memory.
+5. Add quick sanity tests:
 
-Confirm num_output_patches is correct for your training objective (future tokens must be the last tokens).
+   * sparse mode does **not** create 4D mask
+   * context tokens cannot attend to future tokens (leak test)
+   * future tokens can attend globally (performance/quality check)
+   * REG global option behaves as intended (REG gathers global summary)
 
-Decide batch size + grad accumulation settings for long contexts (e.g., 8k/16k) and check memory.
+---
 
-Add quick sanity tests:
-
-sparse mode does not create 4D mask
-
-context tokens cannot attend to future tokens (leak test)
-
-future tokens can attend globally (performance/quality check)
-
-REG global option behaves as intended (REG gathers global summary)
+If you paste this into a new chat, the next assistant should pick up from “Next stage” and proceed with fine-tuning wiring and long-context training details.
