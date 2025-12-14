@@ -152,10 +152,10 @@ class Chronos2Encoder(nn.Module):
             position_ids = torch.arange(0, seq_length, dtype=torch.long, device=inputs_embeds.device).unsqueeze(0)
 e
         if attention_mask is None:
-             attention_mask = torch.ones(batch_size, seq_length, device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+            attention_mask = torch.ones(batch_size, seq_length, device=inputs_embeds.device, dtype=inputs_embeds.dtype)
 
 
-        # make the time attention mask broadcastable to attention scores (batch, n_heads, q_len, kv_len) and invert
+    # make the time attention mask broadcastable to attention scores (batch, n_heads, q_len, kv_len) and invert
         # Time attention mask:
         # - full attention expects an additive 4D mask [batch, heads, q_len, kv_len]
         # - sparse attention expects a 2D padding mask [batch, seq_len]
@@ -176,7 +176,7 @@ e
             layer_outputs: Chronos2EncoderBlockOutput = layer_module(
                 hidden_states,
                 position_ids=position_ids,
-                attention_mask=time_attention_mast,
+                attention_mask=time_attention_mask,
                 group_time_mask=group_time_mask,
                 num_output_patches=num_output_patches,
                 reg_token_index=reg_token_index,
@@ -625,12 +625,12 @@ class Chronos2Model(PreTrainedModel):
             group_ids = torch.arange(batch_size, dtype=torch.long, device=self.device)
 
         encoder_outputs: Chronos2EncoderOutput = self.encoder(
-            num_output_patches - num_output_patches,
+            num_output_patches = num_output_patches,
             attention_mask=attention_mask,
             inputs_embeds=input_embeds,
             group_ids=group_ids,
             output_attentions=output_attentions,
-            reg_token_index = reg_token_index,
+            reg_token_index=reg_token_index,
         )
         return encoder_outputs, loc_scale, patched_future_covariates_mask, num_context_patches
 
