@@ -6,9 +6,11 @@
 import warnings
 from typing import TYPE_CHECKING, cast
 
+import torch
 from torch.utils.data import DataLoader, Dataset
 from transformers.trainer import Trainer
 from transformers.trainer_callback import TrainerCallback
+
 
 if TYPE_CHECKING:
     from chronos.chronos2.dataset import Chronos2Dataset
@@ -26,6 +28,39 @@ def seed_worker(worker_id: int):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
+def _warn_flash_backend_dataset_mismatch(model, dataset, split: str) -> None:
+    """FlashAttention local sliding-window requires CUDA + bf16/fp16 and (in our implementation)
+    a fully-valid context mask (no padding) to hit the fast path. We warn if the dataset likely
+    prevents Flash from being used.
+    """
+    backend = getattr(getattr(model, "config", None), "time_attention_backend", "torch")
+    if backend != "flash":
+        return
+
+    # Check device
+    try:
+        dev = next(model.parameters()).device
+    except StopIteration:
+        dev = None
+
+    if dev is None or dev.type != "cuda":
+        warnings.warn(
+            f"[{split}] time_attention_backend='flash' but model is not on CUDA. "
+            f"FlashAttention will not run (will error or fall back).",
+            category=UserWarning,
+            stacklevel=3,
+        )
+        return
+
+    # Check dataset full-context setting (added in your dataset.py edits)
+    if not bool(getattr(dataset, "require_full_context", False)):
+        warnings.warn(
+            f"[{split}] time_attention_backend='flash' but dataset.require_full_context is False. "
+            f"Context padding/masking will likely prevent the Flash sliding-window fast path from triggering. "
+            f"Build the dataset with require_full_context=True when using Flash.",
+            category=UserWarning,
+            stacklevel=3,
+        )
 
 class EvaluateAndSaveFinalStepCallback(TrainerCallback):
     """Callback to evaluate and save the model at last training step."""
@@ -48,6 +83,7 @@ class Chronos2Trainer(Trainer):
             raise ValueError("Trainer: training requires a train_dataset.")
 
         train_dataset = cast("Chronos2Dataset", self.train_dataset)
+        _warn_flash_backend_dataset_mismatch(self.model, train_dataset, split="train")
 
         if self.args.train_batch_size > train_dataset.batch_size:
             warnings.warn(
@@ -79,7 +115,8 @@ class Chronos2Trainer(Trainer):
             raise ValueError("Trainer: evaluation requires an eval_dataset.")
 
         eval_dataset = cast("Chronos2Dataset", self.eval_dataset)
-
+        _warn_flash_backend_dataset_mismatch(self.model, eval_dataset, split="eval")
+        
         if self.args.eval_batch_size > eval_dataset.batch_size:
             warnings.warn(
                 f"The batch_size of the eval_dataset ({eval_dataset.batch_size}) does not match the batch_size "

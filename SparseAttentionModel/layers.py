@@ -13,6 +13,17 @@ from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
 from transformers.utils import ModelOutput
 from torch.utils.checkpoint import checkpoint
 
+# Optional FlashAttention (for fast sliding-window local attention)
+_flash_attn_func = None
+try:
+    from flash_attn import flash_attn_func as _flash_attn_func  # flash-attn >= 2
+except Exception:
+    try:
+        from flash_attn.flash_attn_interface import flash_attn_func as _flash_attn_func  # alternative path
+    except Exception:
+        _flash_attn_func = None
+
+
 from .config import Chronos2CoreConfig
 
 
@@ -298,6 +309,56 @@ class MHA(nn.Module):
         attn_output = self.o(attn_output)
 
         return AttentionOutput(hidden_states=attn_output, attn_weights=attn_weights if output_attentions else None)
+def _flash_sliding_window_local_attn_no_scale(
+    q: torch.Tensor,  # [B, H, S, Hd]
+    k: torch.Tensor,  # [B, H, S, Hd]
+    v: torch.Tensor,  # [B, H, S, Hd]
+    *,
+    radius: int,
+    dropout_p: float,
+    training: bool,
+) -> torch.Tensor:
+    """FlashAttention sliding-window local attention with *no scaling* (softmax_scale=1.0).
+    Returns: [B, H, S, Hd]
+    """
+    if _flash_attn_func is None:
+        raise RuntimeError(
+            "FlashAttention is not available. Install flash-attn and set time_attention_backend='flash'."
+        )
+
+    radius = int(radius)
+
+    # flash-attn expects [B, S, H, Hd]
+    q_ = rearrange(q, "b h s d -> b s h d").contiguous()
+    k_ = rearrange(k, "b h s d -> b s h d").contiguous()
+    v_ = rearrange(v, "b h s d -> b s h d").contiguous()
+
+    p = float(dropout_p) if training else 0.0
+
+    # Try a few signatures to be robust across flash-attn versions
+    out = None
+    try:
+        out = _flash_attn_func(
+            q_,
+            k_,
+            v_,
+            dropout_p=p,
+            causal=False,
+            window_size=(radius, radius),
+            softmax_scale=1.0,  # IMPORTANT: match Chronos-2 "no scaling"
+        )
+    except TypeError:
+        try:
+            # some versions: (q, k, v, dropout_p, causal, softmax_scale, window_size)
+            out = _flash_attn_func(q_, k_, v_, p, False, 1.0, (radius, radius))
+        except TypeError:
+            # last fallback: no softmax_scale kw
+            out = _flash_attn_func(q_, k_, v_, dropout_p=p, causal=False, window_size=(radius, radius))
+
+    if isinstance(out, tuple):
+        out = out[0]
+
+    return rearrange(out, "b s h d -> b h s d")
 
 
 class TimeSelfAttention(nn.Module):
@@ -461,7 +522,8 @@ class TimeSelfAttention(nn.Module):
 
         out = torch.zeros((B, H, S, Hd), device=hidden_states.device, dtype=hidden_states.dtype)
 
-        # -------------------------
+
+          # -------------------------
         # 1) Context queries: windowed attention over keys in [0, context_end)
         # -------------------------
         radius = int(getattr(self.config, "time_local_radius", 128))
@@ -470,111 +532,99 @@ class TimeSelfAttention(nn.Module):
         chunk_size = max(1, chunk_size)
         win = 2 * radius + 1
 
+        backend = getattr(self.config, "time_attention_backend", "torch")
+        if backend not in {"torch", "flash"}:
+            raise ValueError(f"time_attention_backend must be 'torch' or 'flash', got {backend!r}")
+        use_flash_backend = backend == "flash"
+
         if context_end > 0:
             k_ctx = k[:, :, :context_end, :]  # [B, H, Ctx, Hd]
             v_ctx = v[:, :, :context_end, :]
             key_pad_ctx = key_pad[:, :context_end]  # [B, Ctx]
 
-            offsets = torch.arange(-radius, radius + 1, device=hidden_states.device, dtype=torch.long)  # [win]
-            # offsets = torch.arange(-radius, radius + 1, device=hidden_states.device, dtype=torch.long)  # [win]
-            def _ctx_chunk_attn(
-                q_chunk: torch.Tensor,      # [B, H, C, Hd]
-                idx: torch.Tensor,          # [C, W]
-                valid: torch.Tensor,        # [C, W] bool
-                k_ctx: torch.Tensor,        # [B, H, Ctx, Hd]
-                v_ctx: torch.Tensor,        # [B, H, Ctx, Hd]
-                key_pad_ctx: torch.Tensor,  # [B, Ctx] bool
-            ) -> torch.Tensor:
-                # Gather K/V: [B, H, C, W, Hd]
-                k_win = k_ctx[:, :, idx, :]
-                v_win = v_ctx[:, :, idx, :]
+            # Fast path: FlashAttention sliding-window local attention for the context block.
+            # Only safe when there is no padding inside the context (all tokens valid).
+            if use_flash_backend:
+                if _flash_attn_func is None:
+                    raise RuntimeError(
+                        "time_attention_backend='flash' but FlashAttention is not installed/available."
+                    )
+                if not hidden_states.is_cuda:
+                    raise RuntimeError("FlashAttention backend requires CUDA tensors.")
+                if hidden_states.dtype not in (torch.float16, torch.bfloat16):
+                    raise RuntimeError("FlashAttention backend requires fp16/bf16 hidden_states.")
 
-                # Key mask: [B, C, W]
-                key_ok = key_pad_ctx[:, idx] & valid[None, :, :]
+            can_use_flash = use_flash_backend and bool(key_pad_ctx.all().item())
 
-                # Scores: [B, H, C, W] (no scaling)
-                scores = (q_chunk.unsqueeze(-2) * k_win).sum(dim=-1)
-                finfo_min = torch.finfo(scores.dtype).min
-                scores = scores.masked_fill(~key_ok[:, None, :, :], finfo_min)
+            if can_use_flash:
+                q_ctx = q[:, :, :context_end, :]  # [B, H, Ctx, Hd]
+                out_ctx = _flash_sliding_window_local_attn_no_scale(
+                    q_ctx,
+                    k_ctx,
+                    v_ctx,
+                    radius=radius,
+                    dropout_p=float(self.self_attention.dropout),
+                    training=self.training,
+                )
+                out[:, :, :context_end, :] = out_ctx
 
-                w = nn.functional.softmax(scores.float(), dim=-1).to(scores.dtype)
-                w = nn.functional.dropout(w, p=self.self_attention.dropout, training=self.training)
+            else:
+                offsets = torch.arange(-radius, radius + 1, device=hidden_states.device, dtype=torch.long)
 
-                # Output: [B, H, C, Hd]
-                return (w.unsqueeze(-1) * v_win).sum(dim=-2)
-                
-                
-                
-            for start in range(0, context_end, chunk_size):
-                end = min(context_end, start + chunk_size)
-                q_pos = torch.arange(start, end, device=hidden_states.device, dtype=torch.long)  # [C]
-                C = q_pos.numel()
+                # offsets = torch.arange(-radius, radius + 1, device=hidden_states.device, dtype=torch.long)  # [win]
+                def _ctx_chunk_attn(
+                    q_chunk: torch.Tensor,      # [B, H, C, Hd]
+                    idx: torch.Tensor,          # [C, W]
+                    valid: torch.Tensor,        # [C, W] bool
+                    k_ctx: torch.Tensor,        # [B, H, Ctx, Hd]
+                    v_ctx: torch.Tensor,        # [B, H, Ctx, Hd]
+                    key_pad_ctx: torch.Tensor,  # [B, Ctx] bool
+                ) -> torch.Tensor:
+                    # Gather K/V: [B, H, C, W, Hd]
+                    k_win = k_ctx[:, :, idx, :]
+                    v_win = v_ctx[:, :, idx, :]
 
-                # Raw window indices [C, win]
-                idx_raw = q_pos[:, None] + offsets[None, :]  # [C, win]
-                valid = (idx_raw >= 0) & (idx_raw < context_end)
-                idx = idx_raw.masked_fill(~valid, 0)  # safe for gather
+                    # Key mask: [B, C, W]
+                    key_ok = key_pad_ctx[:, idx] & valid[None, :, :]
 
-                # Optional: append REG as a global key for all context queries
-                if bool(getattr(self.config, "time_reg_is_global", False)) and reg_token_index is not None:
-                    if not (0 <= reg_token_index < context_end):
-                        # If reg_token_index is out of context_end, ignore it (it must be before future)
-                        pass
+                    # Scores: [B, H, C, W] (no scaling)
+                    scores = (q_chunk.unsqueeze(-2) * k_win).sum(dim=-1)
+
+                    # Mask invalid keys
+                    scores = scores.masked_fill(~key_ok[:, None, :, :], torch.finfo(scores.dtype).min)
+
+                    # Softmax over window
+                    w = nn.functional.softmax(scores.float(), dim=-1).to(scores.dtype)
+                    w = nn.functional.dropout(w, p=self.self_attention.dropout, training=self.training)
+
+                    # Output: [B, H, C, Hd]
+                    return (w.unsqueeze(-1) * v_win).sum(dim=-2)
+
+                for start in range(0, context_end, chunk_size):
+                    end = min(context_end, start + chunk_size)
+                    q_pos = torch.arange(start, end, device=hidden_states.device, dtype=torch.long)  # [C]
+                    C = q_pos.numel()
+
+                    # Raw window indices [C, win]
+                    idx_raw = q_pos[:, None] + offsets[None, :]  # [C, win]
+                    valid = (idx_raw >= 0) & (idx_raw < context_end)
+                    idx = idx_raw.clamp(0, context_end - 1)
+
+                    q_chunk = q[:, :, start:end, :]  # [B, H, C, Hd]
+
+                    # During training, checkpointing prevents storing huge per-chunk window tensors for backward.
+                    if self.training and q_chunk.requires_grad:
+                        try:
+                            out_chunk = checkpoint(
+                                _ctx_chunk_attn, q_chunk, idx, valid, k_ctx, v_ctx, key_pad_ctx, use_reentrant=False
+                            )
+                        except TypeError:
+                            # older torch versions don’t accept use_reentrant
+                            out_chunk = checkpoint(_ctx_chunk_attn, q_chunk, idx, valid, k_ctx, v_ctx, key_pad_ctx)
                     else:
-                        # Add a final column for reg_token_index, but mask it out if it already exists in-window
-                        in_window = (idx == reg_token_index) & valid
-                        need_reg = ~in_window.any(dim=-1)  # [C]
-                        idx = torch.cat(
-                            [idx, torch.full((C, 1), reg_token_index, device=idx.device, dtype=idx.dtype)], dim=-1
-                        )
-                        valid = torch.cat([valid, need_reg[:, None]], dim=-1)
+                        out_chunk = _ctx_chunk_attn(q_chunk, idx, valid, k_ctx, v_ctx, key_pad_ctx)
 
-                # W = idx.shape[1]
-
-                # # Gather K/V: [B, H, C, W, Hd]
-                
-                
-                # # Gather K/V using advanced indexing: [B, H, C, W, Hd]
-                # k_win = k_ctx[:, :, idx, :]
-                # v_win = v_ctx[:, :, idx, :]
-
-                # # Key padding gathered: [B, C, W]
-                # key_ok = key_pad_ctx[:, idx]
-                
-                
-                
-                # key_ok = key_ok & valid[None, :, :]  # also apply window validity
-
-                # # Scores: [B, H, C, W] (no scaling)
-                # q_chunk = q[:, :, start:end, :]  # [B, H, C, Hd]
-                # scores = (q_chunk.unsqueeze(-2) * k_win).sum(dim=-1)
-
-                # finfo_min = torch.finfo(scores.dtype).min
-                # scores = scores.masked_fill(~key_ok[:, None, :, :], finfo_min)
-
-                # w = nn.functional.softmax(scores.float(), dim=-1).to(scores.dtype)
-                # w = nn.functional.dropout(w, p=self.self_attention.dropout, training=self.training)
-
-                # out[:, :, start:end, :] = (w.unsqueeze(-1) * v_win).sum(dim=-2)
-                
-                q_chunk = q[:, :, start:end, :]  # [B, H, C, Hd]
-
-                # During training, checkpointing prevents storing huge per-chunk window tensors for backward.
-                if self.training and q_chunk.requires_grad:
-                    try:
-                        out_chunk = checkpoint(
-                            _ctx_chunk_attn, q_chunk, idx, valid, k_ctx, v_ctx, key_pad_ctx, use_reentrant=False
-                        )
-                    except TypeError:
-                        # older torch versions don’t accept use_reentrant
-                        out_chunk = checkpoint(_ctx_chunk_attn, q_chunk, idx, valid, k_ctx, v_ctx, key_pad_ctx)
-                else:
-                    out_chunk = _ctx_chunk_attn(q_chunk, idx, valid, k_ctx, v_ctx, key_pad_ctx)
-
-                out[:, :, start:end, :] = out_chunk
-
-                
-                
+                    out[:, :, start:end, :] = out_chunk
 
             # Optional: REG as a global *query* (REG attends to all context keys)
             if bool(getattr(self.config, "time_reg_is_global", False)) and reg_token_index is not None:

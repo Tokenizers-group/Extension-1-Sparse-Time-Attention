@@ -9,6 +9,7 @@ from typing import cast
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from einops import rearrange, repeat
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput
@@ -250,6 +251,25 @@ class Chronos2Model(PreTrainedModel):
             dropout_p=config.dropout_rate,
         )
 
+        
+        # Optional time-landmark tokens (summary tokens inside the context sequence).
+        # Use getattr so older configs still run.
+        self.time_use_landmarks: bool = bool(getattr(config, "time_use_landmarks", False))
+        self.time_landmark_stride: int = int(getattr(config, "time_landmark_stride", 64))
+        self.time_landmark_project: bool = bool(getattr(config, "time_landmark_project", False))
+
+        if self.time_use_landmarks:
+            if self.time_landmark_project:
+                self.time_landmark_proj = nn.Linear(config.d_model, config.d_model, bias=False)
+            else:
+                self.time_landmark_proj = None
+            # A small learned type embedding so the model can distinguish landmarks from patch tokens.
+            self.time_landmark_type_embed = nn.Parameter(torch.zeros(1, 1, config.d_model))
+        else:
+            self.time_landmark_proj = None
+            self.register_parameter("time_landmark_type_embed", None)
+
+        
         # patching layer
         self.patch = Patch(
             patch_size=self.chronos_config.input_patch_size, patch_stride=self.chronos_config.input_patch_stride
@@ -562,6 +582,75 @@ class Chronos2Model(PreTrainedModel):
 
         return loss
 
+    def _interleave_time_landmarks(
+        self,
+        ctx_embeds: torch.Tensor,        # [B, S, D]
+        ctx_pad_mask: torch.Tensor,      # [B, S] (0/1 float or bool), 1 = valid
+        ctx_position_ids: torch.Tensor,  # [1, S] time positions for the patch tokens
+        stride: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Inserts one pooled landmark token per chunk of `stride` context tokens.
+
+        Returns
+        -------
+        new_ctx_embeds: [B, S + M, D]
+        new_ctx_pad_mask: [B, S + M]  (same dtype as ctx_pad_mask)
+        new_ctx_position_ids: [1, S + M]  (does NOT shift future time indices)
+        """
+        bsz, seq_len, d_model = ctx_embeds.shape
+        if seq_len == 0:
+            return ctx_embeds, ctx_pad_mask, ctx_position_ids
+
+        stride = int(stride)
+        assert stride > 0, "time_landmark_stride must be > 0"
+
+        num_chunks = (seq_len + stride - 1) // stride
+        out_len = seq_len + num_chunks
+
+        out_embeds = ctx_embeds.new_empty((bsz, out_len, d_model))
+        out_mask = ctx_pad_mask.new_zeros((bsz, out_len))
+        out_pos = ctx_position_ids.new_empty((1, out_len))
+
+        # float mask for pooling
+        mask_f = ctx_pad_mask.to(dtype=ctx_embeds.dtype)
+
+        out_ptr = 0
+        for i in range(num_chunks):
+            s = i * stride
+            e = min(s + stride, seq_len)
+            chunk_len = e - s
+
+            # Copy original context tokens
+            out_embeds[:, out_ptr : out_ptr + chunk_len, :] = ctx_embeds[:, s:e, :]
+            out_mask[:, out_ptr : out_ptr + chunk_len] = ctx_pad_mask[:, s:e]
+            out_pos[:, out_ptr : out_ptr + chunk_len] = ctx_position_ids[:, s:e]
+            out_ptr += chunk_len
+
+            # Compute pooled landmark for this chunk (mask-aware mean)
+            chunk_mask = mask_f[:, s:e]  # [B, chunk_len]
+            denom = chunk_mask.sum(dim=1, keepdim=True)  # [B, 1]
+            lm = (ctx_embeds[:, s:e, :] * chunk_mask.unsqueeze(-1)).sum(dim=1) / denom.clamp_min(1.0)  # [B, D]
+
+            if self.time_landmark_proj is not None:
+                lm = self.time_landmark_proj(lm)
+
+            lm = lm.unsqueeze(1) + self.time_landmark_type_embed.to(dtype=lm.dtype)  # [B, 1, D]
+
+            out_embeds[:, out_ptr : out_ptr + 1, :] = lm
+            out_mask[:, out_ptr] = (denom.squeeze(1) > 0).to(dtype=ctx_pad_mask.dtype)
+
+            # Landmark position id: midpoint of its chunk in the *original* context timeline
+            mid = s + ((chunk_len - 1) // 2) if chunk_len > 0 else s
+            out_pos[:, out_ptr] = mid
+
+            out_ptr += 1
+
+        assert out_ptr == out_len
+        return out_embeds, out_mask, out_pos
+
+    
+    
     def encode(
         self,
         context: torch.Tensor,
@@ -594,15 +683,37 @@ class Chronos2Model(PreTrainedModel):
 
         # get input embeddings of shape (batch, num_context_patches, d_model)
         input_embeds: torch.Tensor = self.input_patch_embedding(patched_context)
+
+        # Make attention_mask a 0/1 float mask (sparse path expects padding mask [B, S]).
+        attention_mask = attention_mask.to(self.dtype)
+
+        # Build context position ids on the *true* context timeline (0..num_context_patches-1).
+        # If we insert landmark tokens, we will assign them position ids inside the same timeline,
+        # so future position ids are NOT shifted by landmarks.
+        ctx_position_ids = torch.arange(
+            0, num_context_patches, dtype=torch.long, device=input_embeds.device
+        ).unsqueeze(0)
+
+        # Optional: interleave pooled landmark tokens inside the context sequence
+        if getattr(self, "time_use_landmarks", False):
+            input_embeds, attention_mask, ctx_position_ids = self._interleave_time_landmarks(
+                ctx_embeds=input_embeds,
+                ctx_pad_mask=attention_mask,
+                ctx_position_ids=ctx_position_ids,
+                stride=getattr(self, "time_landmark_stride", 64),
+            )
+
         # append [REG] special token embedding, if needed
         if self.chronos_config.use_reg_token:
-            reg_token_index = num_context_patches
+            # REG is after (context + landmarks)
+            reg_token_index = input_embeds.shape[-2]
             reg_input_ids = torch.full((batch_size, 1), self.config.reg_token_id, device=input_embeds.device)
             reg_embeds = self.shared(reg_input_ids)
             input_embeds = torch.cat([input_embeds, reg_embeds], dim=-2)
-            attention_mask = torch.cat(
-                [attention_mask.to(self.dtype), torch.ones_like(reg_input_ids).to(self.dtype)], dim=-1
-            )
+
+            reg_attn = torch.ones((batch_size, 1), dtype=self.dtype, device=input_embeds.device)
+            attention_mask = torch.cat([attention_mask, reg_attn], dim=-1)
+
 
         patched_future, patched_future_covariates_mask = self._prepare_patched_future(
             future_covariates=future_covariates,
@@ -619,14 +730,60 @@ class Chronos2Model(PreTrainedModel):
         # concatenate context and future embeddings and masks
         input_embeds = torch.cat([input_embeds, future_embeds], dim=-2)
         attention_mask = torch.cat([attention_mask, future_attention_mask], dim=-1)
+                # Final position_ids: keep future positions consistent with the original (no-landmark) layout.
+        # Context patch tokens use [0..num_context_patches-1] (already in ctx_position_ids, even with landmarks).
+        # REG gets position_id = num_context_patches (as if it were directly after context patches).
+        # Future starts at num_context_patches + 1 if REG is present, else at num_context_patches.
+        # ------------------------------------------------------------
+        # Final position_ids: keep future positions consistent with the
+        # original (no-landmark) layout.
+        #
+        # - Context patch tokens: [0 .. num_context_patches-1]
+        #   (landmarks get position ids inside this same timeline)
+        # - REG (if used): position_id = num_context_patches
+        # - Future starts at:
+        #     num_context_patches + 1   if REG is present
+        #     num_context_patches       otherwise
+        # ------------------------------------------------------------
+        if self.chronos_config.use_reg_token:
+            reg_pos = torch.full(
+                (1, 1),
+                num_context_patches,
+                dtype=torch.long,
+                device=input_embeds.device,
+            )
+            future_start = num_context_patches + 1
+        else:
+            reg_pos = None
+            future_start = num_context_patches
+
+        future_position_ids = torch.arange(
+            future_start,
+            future_start + num_output_patches,
+            dtype=torch.long,
+            device=input_embeds.device,
+        ).unsqueeze(0)
+
+        if self.chronos_config.use_reg_token:
+            # ctx_position_ids already includes landmarks if enabled
+            position_ids = torch.cat([ctx_position_ids, reg_pos, future_position_ids], dim=-1)  # type: ignore[arg-type]
+        else:
+            position_ids = torch.cat([ctx_position_ids, future_position_ids], dim=-1)
+
+        # Safety check: position_ids must match the final sequence length
+        assert position_ids.shape[-1] == input_embeds.shape[-2], (
+            f"position_ids length {position_ids.shape[-1]} != seq_len {input_embeds.shape[-2]}"
+        )
+
 
         if group_ids is None:
             # by default, each time series is treated independently, i.e., no mixing across the batch
             group_ids = torch.arange(batch_size, dtype=torch.long, device=self.device)
 
         encoder_outputs: Chronos2EncoderOutput = self.encoder(
-            num_output_patches = num_output_patches,
+            num_output_patches=num_output_patches,
             attention_mask=attention_mask,
+            position_ids=position_ids,          # <-- ADD THIS
             inputs_embeds=input_embeds,
             group_ids=group_ids,
             output_attentions=output_attentions,
@@ -725,7 +882,19 @@ class Chronos2Model(PreTrainedModel):
             output_attentions=output_attentions,
         )
         hidden_states: torch.Tensor = encoder_outputs[0]
-        assert hidden_states.shape == (batch_size, num_context_patches + 1 + num_output_patches, self.model_dim)
+
+        num_landmarks = 0
+        if getattr(self, "time_use_landmarks", False):
+            stride = int(getattr(self, "time_landmark_stride", 64))
+            num_landmarks = (num_context_patches + stride - 1) // stride
+
+        num_reg = 1 if self.chronos_config.use_reg_token else 0
+
+        expected_seq = num_context_patches + num_landmarks + num_reg + num_output_patches
+        assert hidden_states.shape == (batch_size, expected_seq, self.model_dim), (
+            f"hidden_states shape {tuple(hidden_states.shape)} != expected {(batch_size, expected_seq, self.model_dim)}"
+        )
+
 
         # slice the last num_output_patches hidden states to be input into the output_patch_embedding
         forecast_embeds = hidden_states[:, -num_output_patches:]

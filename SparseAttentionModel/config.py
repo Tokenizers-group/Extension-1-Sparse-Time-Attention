@@ -67,9 +67,15 @@ class Chronos2CoreConfig(PretrainedConfig):
         rope_theta: float = 10000.0,
         attn_implementation: Literal["eager", "sdpa"] | None = None,
         time_attention_type: Literal["full", "windowed_future_global"] = "full",
-        time_local_radius: int = 128, 
-        time_attention_chunk_size: int = 32, 
-        time_reg_is_global: bool= False,
+        time_local_radius: int = 128,
+        time_attention_backend: Literal["torch", "flash"] = "torch",
+        time_use_landmarks: bool = False,
+        time_landmark_stride: int = 64,
+        time_landmark_project: bool = False,
+        time_attention_chunk_size: int = 32,
+        time_reg_is_global: bool = False, 
+        
+        
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -87,6 +93,15 @@ class Chronos2CoreConfig(PretrainedConfig):
         self.time_local_radius = time_local_radius
         self.time_attention_chunk_size = time_attention_chunk_size
         self.time_reg_is_global = time_reg_is_global
+        assert time_attention_backend in {"torch", "flash"}, (
+            f"time_attention_backend must be 'torch' or 'flash', got {time_attention_backend!r}"
+        )
+        assert time_landmark_stride > 0, "time_landmark_stride must be > 0"
+        self.time_attention_backend = time_attention_backend
+        self.time_use_landmarks = time_use_landmarks
+        self.time_landmark_stride = time_landmark_stride
+        self.time_landmark_project = time_landmark_project
+
 
         act_info = self.feed_forward_proj.split("-")
         self.dense_act_fn = act_info[-1]

@@ -105,6 +105,16 @@ class Chronos2Pipeline(BaseChronosPipeline):
         finetune_mode: Literal["full", "lora"] = "full",
         lora_config: "LoraConfig | dict | None" = None,
         context_length: int | None = None,
+
+        # -------- new: time-attention throughput knobs --------
+        time_attention_backend: Literal["torch", "flash"] | None = None,
+        time_use_landmarks: bool | None = None,
+        time_landmark_stride: int | None = None,
+        time_landmark_project: bool | None = None,
+        time_local_radius: int | None = None,
+        time_attention_chunk_size: int | None = None,
+        # ------------------------------------------------------
+
         learning_rate: float = 1e-6,
         num_steps: int = 1000,
         batch_size: int = 256,
@@ -113,6 +123,7 @@ class Chronos2Pipeline(BaseChronosPipeline):
         finetuned_ckpt_name: str = "finetuned-ckpt",
         **extra_trainer_kwargs,
     ) -> "Chronos2Pipeline":
+
         """
         Fine-tune a copy of the current Chronos-2 model on the given inputs and return a new pipeline.
 
@@ -192,10 +203,39 @@ class Chronos2Pipeline(BaseChronosPipeline):
 
         config = deepcopy(self.model.config)
         config.chronos_config["context_length"] = context_length
-        config.chronos_config["time_encoding_scale"] = config.chronos_config.get("time_encoding_scale", context_length)
- 
+        config.chronos_config["time_encoding_scale"] = context_length
+
+        # -------- new: apply time-attention/landmark overrides to the copied config --------
+        if time_attention_backend is not None:
+            if time_attention_backend not in ("torch", "flash"):
+                raise ValueError(f"time_attention_backend must be 'torch' or 'flash', got {time_attention_backend!r}")
+            setattr(config, "time_attention_backend", time_attention_backend)
+
+        if time_use_landmarks is not None:
+            setattr(config, "time_use_landmarks", bool(time_use_landmarks))
+
+        if time_landmark_stride is not None:
+            if int(time_landmark_stride) <= 0:
+                raise ValueError("time_landmark_stride must be > 0")
+            setattr(config, "time_landmark_stride", int(time_landmark_stride))
+
+        if time_landmark_project is not None:
+            setattr(config, "time_landmark_project", bool(time_landmark_project))
+
+        if time_local_radius is not None:
+            if int(time_local_radius) < 0:
+                raise ValueError("time_local_radius must be >= 0")
+            setattr(config, "time_local_radius", int(time_local_radius))
+
+        if time_attention_chunk_size is not None:
+            if int(time_attention_chunk_size) <= 0:
+                raise ValueError("time_attention_chunk_size must be > 0")
+            setattr(config, "time_attention_chunk_size", int(time_attention_chunk_size))
+        # -------------------------------------------------------------------------------
+
         model = Chronos2Model(config).to(self.model.device)  # type: ignore
         model.load_state_dict(self.model.state_dict())
+
 
         if finetune_mode == "lora":
             if lora_config is None:
@@ -237,7 +277,9 @@ class Chronos2Pipeline(BaseChronosPipeline):
             output_patch_size=self.model_output_patch_size,
             min_past=min_past,
             mode=DatasetMode.TRAIN,
+            require_full_context=(getattr(config, "time_attention_backend", "torch") == "flash"),
         )
+
 
         if output_dir is None:
             output_dir = Path("chronos-2-finetuned") / time.strftime("%Y-%m-%d_%H-%M-%S")
@@ -286,6 +328,15 @@ class Chronos2Pipeline(BaseChronosPipeline):
             metric_for_best_model=None,
             use_cpu=use_cpu,
         )
+        # -------- new: FlashAttention needs bf16/fp16 (not fp32) --------
+        if getattr(config, "time_attention_backend", "torch") == "flash":
+            if use_cpu:
+                raise ValueError("time_attention_backend='flash' requires CUDA (GPU).")
+
+            # If bf16 isn't available (pre-SM80), enable fp16 autocast in the Trainer
+            if not has_sm80:
+                training_kwargs["fp16"] = True
+        # ----------------------------------------------------------------
 
         eval_dataset = None
         callbacks = []
@@ -298,7 +349,9 @@ class Chronos2Pipeline(BaseChronosPipeline):
                 batch_size=batch_size,
                 output_patch_size=self.model_output_patch_size,
                 mode=DatasetMode.VALIDATION,
+                require_full_context=(getattr(config, "time_attention_backend", "torch") == "flash"),
             )
+
 
             # set validation parameters
             training_kwargs["save_strategy"] = "steps"
@@ -685,6 +738,20 @@ class Chronos2Pipeline(BaseChronosPipeline):
         )
 
         return [batch_prediction[start:end] for (start, end) in target_idx_ranges]
+    def _flash_autocast_dtype(self) -> torch.dtype | None:
+        """If Flash time-attention is enabled, return the dtype we should autocast to for inference.
+        Otherwise return None.
+        """
+        backend = getattr(self.model.config, "time_attention_backend", "torch")
+        if backend != "flash":
+            return None
+        if str(self.model.device) == "cpu":
+            return None
+        if not torch.cuda.is_available():
+            return None
+
+        has_sm80 = torch.cuda.get_device_capability()[0] >= 8
+        return torch.bfloat16 if has_sm80 else torch.float16
 
     def _predict_step(
         self,
@@ -709,9 +776,17 @@ class Chronos2Pipeline(BaseChronosPipeline):
                 future_covariates = future_covariates[..., :output_size]
             kwargs["future_covariates"] = future_covariates
         with torch.no_grad():
-            prediction: torch.Tensor = self.model(
-                context=context, group_ids=group_ids, num_output_patches=num_output_patches, **kwargs
-            ).quantile_preds.to(context)
+            autocast_dtype = self._flash_autocast_dtype()
+            if autocast_dtype is None:
+                prediction: torch.Tensor = self.model(
+                    context=context, group_ids=group_ids, num_output_patches=num_output_patches, **kwargs
+                ).quantile_preds.to(context)
+            else:
+                with torch.autocast(device_type="cuda", dtype=autocast_dtype):
+                    prediction = self.model(
+                        context=context, group_ids=group_ids, num_output_patches=num_output_patches, **kwargs
+                    ).quantile_preds.to(context)
+
 
         return prediction
 
@@ -1106,10 +1181,19 @@ class Chronos2Pipeline(BaseChronosPipeline):
             batch_group_ids = batch["group_ids"]
             batch_target_idx_ranges = batch["target_idx_ranges"]
 
-            encoder_outputs, (locs, scales), *_ = self.model.encode(
-                context=batch_context.to(device=self.model.device, dtype=torch.float32),
-                group_ids=batch_group_ids.to(self.model.device),
-            )
+            autocast_dtype = self._flash_autocast_dtype()
+            if autocast_dtype is None:
+                encoder_outputs, (locs, scales), *_ = self.model.encode(
+                    context=batch_context.to(device=self.model.device, dtype=torch.float32),
+                    group_ids=batch_group_ids.to(self.model.device),
+                )
+            else:
+                with torch.autocast(device_type="cuda", dtype=autocast_dtype):
+                    encoder_outputs, (locs, scales), *_ = self.model.encode(
+                        context=batch_context.to(device=self.model.device, dtype=torch.float32),
+                        group_ids=batch_group_ids.to(self.model.device),
+                    )
+
             batch_embeds = [encoder_outputs[0][start:end].cpu() for (start, end) in batch_target_idx_ranges]
             batch_loc_scales = list(
                 zip(

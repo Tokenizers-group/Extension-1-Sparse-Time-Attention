@@ -421,25 +421,41 @@ class Chronos2Dataset(IterableDataset):
         output_patch_size: int,
         min_past: int = 1,
         mode: str | DatasetMode = DatasetMode.TRAIN,
+        require_full_context: bool = False,
     ) -> None:
+
         super().__init__()
         assert mode in {DatasetMode.TRAIN, DatasetMode.VALIDATION, DatasetMode.TEST}, f"Invalid mode: {mode}"
 
-        self.tasks = Chronos2Dataset._prepare_tasks(inputs, prediction_length, min_past, mode)
         self.context_length = context_length
         self.prediction_length = prediction_length
         self.batch_size = batch_size
         self.num_output_patches = math.ceil(prediction_length / output_patch_size)
         self.min_past = min_past
         self.mode = mode
+        self.require_full_context = bool(require_full_context)
 
+        self.tasks = Chronos2Dataset._prepare_tasks(
+            inputs=inputs,
+            context_length=context_length,
+            prediction_length=prediction_length,
+            min_past=min_past,
+            require_full_context=self.require_full_context,
+            mode=mode,
+        )
+
+
+    # @staticmethod
     @staticmethod
     def _prepare_tasks(
         inputs: Sequence[Mapping[str, TensorOrArray | Mapping[str, TensorOrArray | None]]],
+        context_length: int,
         prediction_length: int,
         min_past: int,
+        require_full_context: bool,
         mode: str | DatasetMode,
     ):
+
         tasks = []
         for idx, raw_task in enumerate(inputs):
             if mode != DatasetMode.TEST:
@@ -457,9 +473,24 @@ class Chronos2Dataset(IterableDataset):
             # convert to a format compatible with model's forward
             task = validate_and_prepare_single_dict_task(raw_task, idx, prediction_length)
 
-            if mode != DatasetMode.TEST and task[0].shape[-1] < min_past + prediction_length:
-                # filter tasks based on min_past + prediction_length
-                continue
+            full_length = task[0].shape[-1]
+
+            if require_full_context:
+                # For FlashAttention local context, we want NO padding in context => always full context window.
+                if mode == DatasetMode.TEST:
+                    # prediction uses the full series end; require enough history for a full context
+                    if full_length < context_length:
+                        continue
+                else:
+                    # TRAIN/VAL: need at least one slice with slice_idx >= context_length and room for prediction_length
+                    min_needed = max(min_past, context_length) + prediction_length
+                    if full_length < min_needed:
+                        continue
+            else:
+                if mode != DatasetMode.TEST and full_length < min_past + prediction_length:
+                    # original behavior
+                    continue
+
             tasks.append(task)
 
         if len(tasks) == 0:
@@ -484,19 +515,47 @@ class Chronos2Dataset(IterableDataset):
 
         if self.mode == DatasetMode.TRAIN:
             # slice a random subsequence from the full series
-            slice_idx = np.random.randint(self.min_past, full_length - self.prediction_length + 1)
+            if self.require_full_context:
+                low = max(self.min_past, self.context_length)
+                high = full_length - self.prediction_length + 1
+                # should be guaranteed by filtering, but keep this safety check
+                if high <= low:
+                    raise RuntimeError(
+                        f"Cannot sample a full context window: full_length={full_length}, "
+                        f"context_length={self.context_length}, prediction_length={self.prediction_length}."
+                    )
+                slice_idx = np.random.randint(low, high)
+            else:
+                slice_idx = np.random.randint(self.min_past, full_length - self.prediction_length + 1)
+
         elif self.mode == DatasetMode.VALIDATION:
             # slice the last window for validation
             slice_idx = full_length - self.prediction_length
+            if self.require_full_context and slice_idx < self.context_length:
+                raise RuntimeError(
+                    f"Validation series too short for full context: full_length={full_length}, "
+                    f"context_length={self.context_length}, prediction_length={self.prediction_length}."
+                )
+
         else:
             # slice the full series for prediction
             slice_idx = full_length
+            if self.require_full_context and slice_idx < self.context_length:
+                raise RuntimeError(
+                    f"Test series too short for full context: full_length={full_length}, context_length={self.context_length}."
+                )
+
 
         if slice_idx >= self.context_length:
             # slice series, if it is longer than context_length
             task_context = task_past_tensor[:, slice_idx - self.context_length : slice_idx]
         else:
+            if self.require_full_context:
+                raise RuntimeError(
+                    f"Expected full context but got slice_idx={slice_idx} < context_length={self.context_length}."
+                )
             task_context = task_past_tensor[:, :slice_idx]
+
 
         # In the TEST mode, we have no target available and the task_future_covariates can be directly used
         # In the TRAIN and VALIDATION modes, the target and task_future_covariates need to be constructed from
@@ -557,7 +616,11 @@ class Chronos2Dataset(IterableDataset):
             target_start_idx += group_size
 
         return {
-            "context": left_pad_and_cat_2D(batch_context_tensor_list),
+             "context": (
+                torch.cat(batch_context_tensor_list, dim=0)
+                if self.require_full_context
+                else left_pad_and_cat_2D(batch_context_tensor_list)
+            ),
             "future_target": None
             if self.mode == DatasetMode.TEST
             else torch.cat(cast(list[torch.Tensor], batch_future_target_tensor_list), dim=0),
@@ -630,7 +693,9 @@ class Chronos2Dataset(IterableDataset):
         output_patch_size: int,
         min_past: int = 1,
         mode: str | DatasetMode = DatasetMode.TRAIN,
+        require_full_context: bool = False,
     ) -> "Chronos2Dataset":
+
         """Convert from different input formats to a Chronos2Dataset."""
         if isinstance(inputs, (torch.Tensor, np.ndarray)):
             inputs = convert_tensor_input_to_list_of_dicts_input(inputs)
@@ -652,4 +717,6 @@ class Chronos2Dataset(IterableDataset):
             output_patch_size=output_patch_size,
             min_past=min_past,
             mode=mode,
+            require_full_context=require_full_context,
         )
+
