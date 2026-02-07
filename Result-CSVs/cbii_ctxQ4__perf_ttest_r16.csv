@@ -1,0 +1,2 @@
+metric_col,radius,chunk_size,backend,n,mean_delta,sd_delta,t,p,test,mean_speedup,median_speedup,mean_delta_peak_alloc_mb,mean_delta_peak_reserved_mb
+MASE,16,256,flash,27,3.845104997033553e-05,0.0013971935429233887,0.14299916963610537,0.8873933151326647,ttest_rel,0.9648144207225623,0.9599660368383659,229.9960033275463,236.88888888888889
